@@ -1,0 +1,271 @@
+---
+title: "Ecography_Commented_Code"
+author: "Adam Eichenwald, Sydne Record"
+date: "2023-10-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tidyverse)
+library(DescTools)
+library(sjPlot)
+library(sjmisc)
+library(sjlabelled)
+library(lme4)
+library(ggplot2)
+library(ForestTools)
+library(terra)
+library(sf)
+library(hexbin)
+```
+
+
+# Creating the canopy shapefile
+``` {r}
+Harvcanopy<- terra::rast("/Users/adameichenwald/Downloads/GLiHT_Prospect_Hill_Jun2012_CHM.tif")
+```
+
+# Plot CHM (extra optional arguments remove labels and tick marks from the plot)
+```{r}
+par(mar = rep(0.5, 4))
+plot(Harvcanopy, xlab = "", ylab = "", xaxt='n', yaxt = 'n')
+```
+# Function for defining dynamic window size
+```{r}
+lin <- function(x){x * 0.05 + 0.6}
+```
+# Detect treetops
+```{r}
+ttops <- vwf(Harvcanopy, winFun = lin, minHeight = 2)
+```
+# Plot CHM
+```{r}
+plot(Harvcanopy, xlab = "", ylab = "", xaxt='n', yaxt = 'n')
+```
+# Add dominant treetops to the plot
+```{r}
+plot(ttops$geometry, col = "blue", pch = 20, cex = 0.5, add = TRUE)
+```
+# Create crown map
+```{r}
+crowns_ras <- mcws(treetops = ttops, CHM = Harvcanopy, minHeight = 1.5)
+expanse(crowns_ras, unit = "m")
+```
+
+# Plot crowns
+```{r}
+plot(crowns_ras, col = sample(rainbow(50), nrow(unique(chm)), replace = TRUE), legend = FALSE, xlab = "", ylab = "", xaxt='n', yaxt = 'n')
+
+class(crowns_ras)
+crownspolygon<-as.polygons(crowns_ras)
+
+writeVector(crownspolygon, "/Users/adameichenwald/Documents/University of Maine/treecrowns.shp")
+```
+
+# Data Import
+
+
+```{r}
+Harv2019 <- read_csv("Harv2019AllInformation.csv")
+```
+
+# 2019 models
+Split the Harvard 2019 dataset into test and train data, so that we can test how well the model predictions work.
+```{r}
+sample <- sample(c(TRUE, FALSE), nrow(Harv2019),
+                 replace=TRUE, prob=c(0.7,0.3))
+train <- Harv2019[sample, ]
+test <- Harv2019[!sample, ]                      
+
+```
+
+### Construct the models.
+Note that we have included height and canopy diameter as interaction terms, using (*) rather than (+). This is to copy Jucker et al, who also use height and canopy diameter as interaction terms. 
+```{r}
+onlyhgtdiam<-lm(data = train,
+                   log(dbh)~log(height*diameter))
+
+includestage<-lm(data = train,
+                         log(dbh)~log(height*
+                           diameter)+
+                           Stage)
+includeshade<-lm(data = train,
+                          log(dbh)~log(height*
+                            diameter)+Shade)
+includestageshade<-lm(data = train,
+                          log(dbh)~log(height*
+                            diameter)+
+                            Stage+Shade)
+
+list<-list(onlyhgtdiam,includeshade, includestage,includestageshade)
+dataframe<-data.frame(model = c("onlyhgtdiam","includeshade",
+                                "includestage","includestageshade"),
+                      AIC = sapply(list, function(x) AIC = AIC(x)))%>%
+  mutate(AIC = ifelse(model == "Harv2019mixedmodel", 
+                      AIC(Harv2019mixedmodel),
+                      AIC))%>%
+  arrange(AIC)
+dataframe
+
+tab_model(includestageshade,includestage,includeshade,onlyhgtdiam,
+          show.aicc = TRUE)
+
+```
+
+
+
+The best model according to AIC includes the effect of both shade and stage of succession as random variables (mixed model).
+
+Test to see whether the variables are correlated.
+
+``` {r}
+chisq.test(Harv2019$Stage, Harv2019$Shade)
+```
+They are. Therefore, the second best model "stage only" is better, since including both variables violates regression assumptions.
+
+### Test the best model
+Predict test dbh from best model in previous section.
+```{r}
+
+predicted <- predict(includestage, test, type="response")
+
+```
+
+Predict test dbh using Jucker et al.'s allometric equation.
+```{r}
+Jucker<-test%>%
+  #mutate(DBH_Jucker = 0.557 * 
+   #        (height * diameter)^0.809 * 
+  #         exp(0.056^2/2))%>%
+#This is the same equation that is in Jucker et al. 2017, except transformed into logspace
+mutate(DBH_Jucker = log(0.557) + 0.809 * log(height * diameter) + 
+           ((0.056^2) / 2))
+```
+
+Examine the r2 and the slope of each model. We would expect the better of the two models to have slopes closer to 1 and have high r2 values.
+
+```{r}
+juckertestmodel<-lm(data=Jucker, log(dbh)~DBH_Jucker)
+stagesmodel<-lm(log(test$dbh)~predicted)
+summary(juckertestmodel)
+summary(stagesmodel)
+confint(juckertestmodel, level = 0.95)
+confint(stagesmodel,  level = 0.95)
+```
+
+Our mixed model has a much higher r2 value and has a slope much closer to 1 than the predictions from Jucker et al, as we would expect based on our hypotheses.
+
+
+```{r}
+
+data.frame(Method = c("Jucker et al.", "Stage Mixed Model"),
+           RMSE = c(RMSE(juckertestmodel), RMSE(stagesmodel)))
+
+
+```
+Our mixed model comes out with a lower RMSE, which again puts it on top as the better model.
+
+
+### Plot the results
+According to Pinero et al. 2008 (Ecological Modeling), "observed (in the y-axis) vs. predicted (in the x-axis) (OP) regressions should be used" rather than vice versa. This is because "a spurious effect is added to the regression parameters when regressing PO values and comparing them against the 1:1 line."
+
+The line in the plots below is not the regression line. It is instead the 1:1 line.
+
+```{r}
+select<-dplyr::select
+ggplotdata<-rbind(Jucker%>%
+  select(DBH_Jucker, dbh, Stage, Shade)%>%
+  rename(predicted = DBH_Jucker)%>%
+  mutate(method = "Jucker et al. (2017)"),
+test%>%
+  select(dbh,Stage, Shade)%>%
+  mutate(predicted = predicted)%>%
+  mutate(method = "Mixed Model (Stage Only)"))
+library(Rmisc)
+ggplotdataCI<-ggplotdata%>%
+  group_by(Stage, method)%>%
+  dplyr::summarize(CI(predicted))%>%
+  ungroup()%>%
+  dplyr::mutate(variable=rep(c("high_x","mean_x","low_x"), 8))%>%
+  pivot_wider(names_from="variable", values_from = "CI(predicted)")%>%
+  cbind(ggplotdata%>%
+          group_by(Stage, method)%>%
+  dplyr::summarize(CI(dbh))%>%
+  ungroup()%>%
+  dplyr::mutate(variable=rep(c("high_y","mean_y","low_y"), 8))%>%
+  pivot_wider(names_from="variable", values_from = "CI(dbh)")%>%
+  select(-Stage, -method))%>%
+  rbind(ggplotdata%>%
+  group_by(Shade, method)%>%
+  dplyr::summarize(CI(predicted))%>%
+  ungroup()%>%
+  dplyr::mutate(variable=rep(c("high_x","mean_x","low_x"), 6))%>%
+  pivot_wider(names_from="variable", values_from = "CI(predicted)")%>%
+  cbind(ggplotdata%>%
+          group_by(Shade, method)%>%
+  dplyr::summarize(CI(dbh))%>%
+  ungroup()%>%
+  dplyr::mutate(variable=rep(c("high_y","mean_y","low_y"),6))%>%
+  pivot_wider(names_from="variable", values_from = "CI(dbh)")%>%
+  select(-method, -Shade))%>%
+  dplyr::rename(Stage = Shade))%>%
+  dplyr::rename(Effect = Stage)%>%
+  mutate(Effect= ifelse(Effect == "high tolerance",
+                        "High shade", Effect))%>%
+  mutate(Effect= ifelse(Effect == "intermediate tolerance",
+                        "Intermediate\nshade", Effect))%>%
+  mutate(Effect= ifelse(Effect == "low tolerance",
+                        "Low shade", Effect))%>%
+  mutate(Effect= ifelse(Effect == "all",
+                        "All stages", Effect))%>%
+   mutate(Effect= ifelse(Effect == "climax",
+                        "Late stage", Effect))%>%
+  mutate(Effect= ifelse(Effect == "early",
+                        "Early stage", Effect))%>%
+  mutate(Effect= ifelse(Effect == "mid",
+                        "Mid stage", Effect))%>%
+  mutate(Effect= factor(Effect, levels = c("Early stage",
+                                           "Mid stage",
+                                           "Late stage",
+                                           "All stages",
+                                           "Low shade",
+                                            "Intermediate\nshade",
+                                           "High shade")))%>%
+  filter(Effect != "Low shade",
+         Effect!= "Intermediate\nshade",
+         Effect != "High shade")
+
+CIfigure1<-ggplot(ggplotdataCI,
+       aes(y=mean_y, x=mean_x, color = Effect))+geom_point()+
+  geom_errorbarh(aes(xmax = high_x, xmin = low_x))+
+  geom_errorbar(aes(ymax = high_y, ymin = low_y))+
+  geom_abline(intercept = 0, slope = 1, lty = 2)+
+  facet_wrap("method")+
+  xlab("Predicted DBH")+ylab("Measured DBH")+
+  theme_bw()+
+  theme(text=element_text(size=13))+
+  xlim(11,35)
+#This is figure 4 in the paper
+CIfigure1
+
+```
+
+```{r}
+hex_scale_log_colors <- scale_fill_gradientn(colours = colorRampPalette(rev(RColorBrewer::brewer.pal(9, 'RdYlBu')), bias=1)(50),
+                                             trans = 'log', name = 'Individuals',
+                                            label = function(x) sprintf("%.2f", x))
+
+heatplot1<-ggplot(ggplotdata, aes(y=dbh, x=predicted))+geom_hex()+
+ hex_scale_log_colors+
+  geom_abline(intercept = 0, slope = 1, lty = 2)+
+  facet_wrap("method")+
+  xlab("Predicted DBH")+ylab("Measured DBH")+
+  theme_bw()+
+  theme(text=element_text(size=13))
+
+#This is figure 3 in the paper
+heatplot1
+
+```
